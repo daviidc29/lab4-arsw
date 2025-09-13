@@ -78,6 +78,10 @@ public class BlueprintsServices {
         return out;
     }
 
-    
+    /** Actualizar un plano existente */
+    public void updateBlueprint(String author, String name, Blueprint updated) throws BlueprintNotFoundException {
+        persistence.updateBlueprint(author, name, updated);
+    }
+
     
 }

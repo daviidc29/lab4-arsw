@@ -1,0 +1,135 @@
+ANÁLISIS DE CONCURRENCIA — BlueprintsRESTAPI (Parte III)
+
+
+Autor: David Santiago Castro
+Fecha: 2025-09-12
+
+
+Contexto:
+
+El componente BlueprintsRESTAPI atiende peticiones HTTP concurrentes en un contenedor de Spring Boot.
+El estado compartido reside en la capa de persistencia en memoria InMemoryBlueprintPersistence, que
+mantiene un Map<Tuple<String,String>, Blueprint> con los planos.
+
+El modelo Blueprint y Point son mutables: Blueprint getPoints() expone la lista interna y
+Point tiene setters. Esto abre la puerta a race conditions cuando múltiples hilos leen o escriben
+simultáneamente o cuando un hilo modifica objetos que otro hilo está usando.
+
+Riesgos identificados:
+
+1) Check then act en saveBlueprint (duplicados)
+   Patrón leer y luego escribir sobre HashMap:
+   - Antes: if (containsKey) { throw } else { put }
+   - Problema: Dos hilos pueden observar “no existe” y ambos hacer put: duplicado o sobreescritura
+   - Región crítica: Verificación y escritura deben ser atómicas.
+
+2) Read modify write en updateBlueprint (pérdida de actualizaciones)  
+   Leer el valor y luego hacer put no es atómico. Dos hilos pueden pisarse mutuamente (lost update)
+   - Región crítica: Búsqueda y reemplazo del blueprint objetivo.
+
+3) Iteración concurrente o visibilidad débil  
+   getAllBlueprints y getBlueprintsByAuthor iteran sobre la colección mientras otros hilos escriben.
+   - Con HashMap: puede lanzar ConcurrentModificationException y carece de garantías de visibilidad.
+   - Región crítica: Iteraciones sobre la estructura compartida.
+
+4) Fuga de mutabilidad (aliasing) hacia el exterior  
+   getBlueprint retornaba la misma instancia almacenada y Blueprint getPoints() expone la lista
+   interna. Un consumidor puede modificarla (o mutar Point), afectando el estado compartido sin pasar
+   por la capa de persistencia. Resultado: lecturas inconsistentes y estados intermedios visibles.
+
+
+
+Estrategia aplicada (alto desempeño, sin locks globales)
+
+A) Estructura concurrente  
+   - Reemplazo de HashMap por ConcurrentHashMap para acceso concurrente sin bloquear el mapa completo.
+
+B) Operaciones atómicas  
+   - saveBlueprint: uso de putIfAbsent(key, valueCopy) para garantizar unicidad atómicamente.
+   - updateBlueprint: uso de computeIfPresent(key, (k,v) -> valueCopy) para reemplazo atómico.
+
+C) Aislamiento de mutabilidad (Copy On Write en el borde de persistencia)  
+   - Se implementó un helper copyOf(Blueprint) que copia profunda los puntos (new Point(x,y))
+     y crea un nuevo Blueprint.  
+   - Siempre se almacena una copia y siempre se retorna una copia. Nadie por fuera puede mutar
+     el objeto almacenado, y ninguna lectura verá cambios parciales de otro hilo.
+   - getAllBlueprints o getBlueprintsByAuthor: retornan conjuntos de copias (snapshot).
+
+D) Granularidad fina (sin sincronización gruesa)
+   - No se sincroniza todo el repositorio ni se usan synchronized globales; se apoya en la concurrencia
+     del ConcurrentHashMap y en primitivas atómicas (putIfAbsent, computeIfPresent).  
+   - Esto evita el throughput collapse típico de sincronizar cada endpoint en alta concurrencia.
+
+
+
+Cambios en código:
+
+Archivo: src/main/java/edu/eci/arsw/blueprints/persistence/impl/InMemoryBlueprintPersistence.java
+
+1. Estructura y operaciones:
+   - Map<Tuple<String,String>, Blueprint> blueprints = new ConcurrentHashMap<>();
+   - saveBlueprint con putIfAbsent (atómico).
+   - updateBlueprint con computeIfPresent (atómico).
+   - getBlueprint retornan copias profundas mediante copyOf`.
+   - getAllBlueprints produce un HashSet con copias (snapshot consistente para el consumidor).
+
+2. Helper de copiado profundo:
+   
+```java
+   private Blueprint copyOf(Blueprint src) {
+       List<Point> pts = src.getPoints();
+       Point[] arr = new Point[pts.size()];
+       for (int i = 0; i < pts.size(); i++) {
+           Point p = pts.get(i);
+           arr[i] = new Point(p.getX(), p.getY());
+       }
+       return new Blueprint(src.getAuthor(), src.getName(), arr);
+   }
+   ```
+
+Justificación de desempeño
+
+- Lecturas concurrentes: ConcurrentHashMap permite alta concurrencia en lectura sin bloquear.
+- Escrituras: putIfAbsent y computeIfPresent realizan operaciones atómicas con mínima contención.
+- Sin copias innecesarias internas: las copias profundas se hacen solo en los bordes (entrada/salida
+  del repositorio), manteniendo a los consumidores aislados de la mutabilidad. En carga real, la latencia de
+  copiado de unos pocos puntos por blueprint es marginal vs. el costo de sincronizar todo el repositorio.
+- Escalabilidad: al evitar un lock de coarse grain, el throughput escala con el número de cores.
+
+Regiones críticas (antes y después)
+- Antes:
+  - saveBlueprint: (containsKey entonces put) [race: duplicados].
+  - updateBlueprint: (get entonces put) [race: lost update].
+  - get: devolvía referencias vivas [race: fuga de mutabilidad].
+  - Iteraciones con HashMap [race: modificación concurrente].
+
+- Después:
+  - saveBlueprint: región crítica encapsulada en putIfAbsent atómico.
+  - updateBlueprint: región crítica encapsulada en computeIfPresent atómico.
+  - get: retornan snapshots (copias); no hay aliasing de objetos compartidos.
+  - Iteraciones: ConcurrentHashMap provee iteradores weakly consistent; 
+
+Pruebas sugeridas (concurrencia)
+
+1) Unicidad en alta concurrencia  
+   100 hilos llaman saveBlueprint con la misma author,name entonces habran exactamente 1 inserción y 99 excepciones.
+
+2) Lectura consistente bajo escritura
+   Mientras un hilo hace updateBlueprint en loop, otros hilos llaman getBlueprint o getAllBlueprints y se
+   valida que siempre reciben objetos válidos y consistentes (nunca estructuras parcialmente mutadas).
+
+3) Carrera de actualización  
+   Dos hilos realizan updateBlueprint simultáneamente con versiones distintas entonces el resultado es una de las
+   dos versiones completas (no mezcladas). No hay lost update parcial (objeto atómico reemplazado).
+
+4) Aislamiento de mutabilidad  
+   Un consumidor edita la lista retornada por getPoints() de un blueprint que recibió vía API; se comprueba
+   que NO afecta el almacenado (porque la lectura fue una copia).
+
+
+Conclusión
+La API presentaba varias condiciones de carrera típicas de repositorios en memoria con modelos mutables.
+Se aplicaron estructuras concurrentes y operaciones atómicas (ConcurrentHashMap, putIfAbsent,
+computeIfPresent) junto con copias profundas en el borde para eliminar aliasing. Con esto, se suprimen
+las race conditions sin pagar el costo de sincronizar globalmente la capa de persistencia, preservando el
+desempeño bajo carga concurrente.

@@ -35,4 +35,11 @@ public interface BlueprintsPersistence {
 
     Set<Blueprint> getBlueprintsByAuthor(String author);
     Set<Blueprint> getAllBlueprints();
+
+    /**
+     * Update/replace an existing blueprint identified by author and name.
+     * @throws BlueprintNotFoundException if the blueprint does not exist
+     */
+    public void updateBlueprint(String author, String name, Blueprint bp) throws BlueprintNotFoundException;
+
 }
